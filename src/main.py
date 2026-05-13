@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 
 from .api.routes import router
+from .audit_log import configure_audit_logger
 from .config import get_settings, reset_settings_cache
 from .logging_setup import configure_logging
 
@@ -26,7 +27,9 @@ load_dotenv()
 # Configure logging at import time so messages emitted during app construction
 # (route registration, middleware setup) flow through the same handlers as
 # request logs. Idempotent — safe under uvicorn auto-reload.
-configure_logging(get_settings())
+_settings_at_import = get_settings()
+configure_logging(_settings_at_import)
+configure_audit_logger(_settings_at_import)
 
 app = FastAPI(title="Eunomia Middleware")
 app.include_router(router, prefix="/v1")
@@ -103,6 +106,7 @@ def main() -> None:
     reset_settings_cache()  # drop anything cached before flags applied
     settings = get_settings()
     configure_logging(settings)  # re-apply with CLI-aware level
+    configure_audit_logger(settings)  # re-wire audit sinks too
 
     # Server config will be wired more fully in Task #5; for now use whatever
     # the loaded settings say (defaults match the previous hardcoded values).

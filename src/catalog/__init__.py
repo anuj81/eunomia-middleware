@@ -103,7 +103,8 @@ def _build_composed_catalog(
     settings = get_settings()
     catalog = _build_catalog_client(om_mock)
     rag = _build_rag_client(rag_enabled, rag_mock)
-    return ComposedCatalog(catalog=catalog, rag=rag, top_k=top_k)
+    # Pass settings so ComposedCatalog can pick the legacy vs Phase D path.
+    return ComposedCatalog(catalog=catalog, rag=rag, top_k=top_k, settings=settings)
 
 
 def get_composed_catalog(settings: Optional[Settings] = None) -> ComposedCatalog:

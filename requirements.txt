@@ -11,6 +11,9 @@ python-dotenv
 requests
 httpx
 
+# JWT validation (Phase D — Keycloak OIDC)
+python-jose[cryptography]
+
 # test
 pytest
 pytest-asyncio
