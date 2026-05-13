@@ -16,7 +16,7 @@ The route layer never imports either subclass directly; it goes through
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
@@ -59,36 +59,65 @@ PiiTagMap = Dict[str, List[str]]
 
 
 class CatalogClient(ABC):
-    """Authority-side catalog: returns the FULL set of views a user may see.
+    """Authority-side catalog client. Two responsibility surfaces:
 
-    Note: this layer does NOT take the NLQ query. Relevance narrowing is the
-    job of `ComposedCatalog` (Phase C), which sits on top of a CatalogClient
-    and an optional RagClient. The split is intentional:
+    1. (Phase A-C / legacy) `get_allowed_views_and_pii(user_identity)`
+       — returns the FULL set of views a user may see PLUS PII tag info,
+         in a single call. Used when authorization decisions live in the
+         catalog client itself (mock with hardcoded role map).
 
-        - CatalogClient = authorization (whitelist of views the user may touch)
-        - RagClient     = relevance (top-K of that whitelist for the prompt)
+    2. (Phase D) `fetch_views_with_pii(view_names)`
+       — given a list of view names already resolved elsewhere (e.g. via
+         OM /search/query against tag policies), fetch the rich view info
+         and PII tag info. Authorization happened BEFORE this call.
 
-    The SQL validator always validates against the CatalogClient's full set —
-    never the RAG-narrowed list — for defense in depth.
+    Both must exist on every CatalogClient subclass so the route layer
+    can pick the right path based on whether OM is the policy decision
+    point (Phase D) or the catalog client is (Phase A-C mock).
+
+    The SQL validator always validates against the catalog's allowed-view
+    list — never the RAG-narrowed list — for defense in depth.
     """
 
     @abstractmethod
     async def get_allowed_views_and_pii(
         self, user_identity: dict
     ) -> Tuple[List[ViewInfo], PiiTagMap]:
-        """Return (allowed_views, pii_tag_map) for the given user.
-
-        Both come from the same authority (OpenMetadata in the real client,
-        an in-memory fixture in the mock).
+        """Phase A-C: returns (allowed_views, pii_tag_map) for the given user.
 
         Args:
-            user_identity: At minimum has {"role": str}. The auth layer may
-                attach additional claims (domain, sub, ...) which subclasses
-                are free to use.
+            user_identity: legacy shape with at minimum `{"role": str}`.
 
         Returns:
             allowed_views: list of ViewInfo the user may query (may be empty).
-            pii_tag_map:   {view_name: [column_name, ...]} for columns the
-                           middleware must mask in results.
+            pii_tag_map:   {view_name: [column_name, ...]} for PII columns.
+        """
+        ...
+
+    @abstractmethod
+    async def fetch_views_with_pii(
+        self,
+        view_names: List[str],
+        bearer_token: Optional[str] = None,
+    ) -> Tuple[List[ViewInfo], PiiTagMap]:
+        """Phase D: hydrate a pre-authorized list of view names.
+
+        Authorization is assumed to have happened upstream (typically via
+        ``src.catalog.om_access.resolve_allowed_views`` which queries OM's
+        tag-policy index). This call only fetches the rich payload + PII tag
+        info for those views.
+
+        Args:
+            view_names:   list of bare view names (no schema prefix).
+            bearer_token: user's JWT to forward to OpenMetadata. When OM is
+                          in OIDC-only mode, no admin login is available, so
+                          the user's token is the only way to authenticate.
+                          Mock implementations ignore this parameter.
+
+        Returns:
+            views:       ViewInfo objects in the same order as ``view_names``,
+                         skipping any that don't exist in the catalog.
+            pii_tags:    {view_name: [pii_column_name, ...]} — only views with
+                         at least one PII-tagged column appear in the map.
         """
         ...

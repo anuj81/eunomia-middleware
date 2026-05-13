@@ -55,3 +55,33 @@ rag:
   top_k: 8
   timeout_seconds: 5
   # api_key: <env-only — see RAG_API_KEY>
+
+# Authentication (Phase D)
+auth:
+  provider: mock                # 'mock' → string-match tokens (offline / CI)
+                                # 'keycloak' → validate Keycloak JWTs against JWKS
+  keycloak:
+    issuer: http://localhost:8080/realms/eunomia
+    audience: null              # null → skip aud check (Keycloak default tokens have empty 'aud')
+    jwks_cache_seconds: 300
+    algorithm: RS256
+  unmask_pii_role: eunomia-pii-unmask
+  admin_bypass_role: eunomia-om-admin
+
+# Authorization map — Keycloak realm role → OM tag FQN. Decision lives in OM.
+authz:
+  role_to_access_tag:
+    eunomia-finance-user:     eunomia-access.finance-user
+    eunomia-external-auditor: eunomia-access.external-auditor
+    eunomia-marketing-lead:   eunomia-access.marketing-lead
+    eunomia-agency-partner:   eunomia-access.agency-partner
+    eunomia-om-admin:         "*"   # wildcard — admin sees the full catalog
+
+# Per-request audit trail (Phase D)
+audit:
+  enabled: true
+  # log_dir: ./logs           # leave null/unset to use logging.log_dir
+  human_file: audit.log       # one human-readable line per request
+  jsonl_file: audit.jsonl     # one JSON object per request (SIEM-friendly)
+  max_bytes: 10485760         # 10 MiB rotation threshold
+  backup_count: 5

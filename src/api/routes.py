@@ -9,6 +9,11 @@ Phase C wiring:
         ├── allowed_views   (full OM list — handed to SQL validator)
         ├── relevant_views  (RAG-narrowed — handed to LLM prompt builder)
         └── pii_tags        (OM-authoritative — handed to PII masker)
+
+Phase D wiring:
+    • verify_token returns the Keycloak JWT identity with roles + raw_token.
+    • Per-request AuditRecord accumulates the trust trail and is emitted once
+      at the SSE terminal event (success, error, or denied).
 """
 
 from __future__ import annotations
@@ -22,7 +27,9 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from ..audit_log import AuditRecord, get_audit_logger
 from ..catalog import ComposedCatalog, fastapi_composed_catalog
+from ..catalog.om_access import has_admin_bypass, has_pii_unmask
 from ..config import get_settings
 from ..execution.db_client import execute_query
 from ..generation.llm_client import generate_sql
@@ -43,10 +50,28 @@ async def execute_nlq_stream(
     user_identity: dict,
     catalog: ComposedCatalog,
 ) -> AsyncIterator[dict]:
+    settings = get_settings()
+
+    # Audit record begins now; emitted at every terminal path (return).
+    audit = AuditRecord.start(identity=user_identity, query=nlq_query)
+    roles_list = user_identity.get("roles") or []
+    audit.unmask_pii   = has_pii_unmask(roles_list, settings)
+    audit.admin_bypass = has_admin_bypass(roles_list, settings)
+    audit_logger = get_audit_logger()
+
+    who = (user_identity.get("preferred_username")
+           or user_identity.get("sub")
+           or user_identity.get("role")
+           or "(anonymous)")
     logger.info(
-        "NLQ received | role=%s | query=%r",
-        user_identity.get("role"), nlq_query,
+        "NLQ received | id=%s user=%s roles=%s query=%r",
+        audit.request_id[:8], who,
+        user_identity.get("roles") or user_identity.get("role"), nlq_query,
     )
+
+    def _emit_audit(status: str, error: str | None = None):
+        audit.finish(status=status, error=error)
+        audit_logger.emit(audit)
 
     yield {"data": json.dumps({"status": "Authenticating & Fetching Roles..."})}
     await asyncio.sleep(0.5)
@@ -56,6 +81,23 @@ async def execute_nlq_stream(
     allowed_view_names = [v.name for v in discovery.allowed_views]   # <- for VALIDATOR
     prompt_views = discovery.relevant_views                          # <- for LLM
     pii_tags = discovery.pii_tags                                    # <- for MASKER
+
+    audit.allowed_views  = list(allowed_view_names)
+    audit.relevant_views = [v.name for v in prompt_views]
+    audit.pii_columns    = {k: list(v) for k, v in (pii_tags or {}).items()}
+
+    if not allowed_view_names:
+        logger.warning("Discovery empty — user has no authorized views.")
+        _emit_audit("denied", error="No authorized views")
+        yield {"event": "complete", "data": json.dumps({
+            "status": "error",
+            "message": (
+                "No views are authorized for your identity. Contact your "
+                "OpenMetadata admin if you believe this is incorrect."
+            ),
+        })}
+        return
+
     logger.debug(
         "Discovery | allowed=%s | relevant=%s",
         allowed_view_names, [v.name for v in prompt_views],
@@ -71,18 +113,16 @@ async def execute_nlq_stream(
 
     # 2. Generation + Validation loop.
     #
-    # IMPORTANT defense-in-depth invariant:
+    # Defense-in-depth invariant:
     #     - The prompt sees ONLY `prompt_views` (top-K).
     #     - The validator checks against ALL `allowed_view_names` (full OM list).
-    # This means the LLM can legitimately pick a view that wasn't in the
-    # top-K but IS in the OM-allowed list — the validator accepts. It can
-    # never pick a view outside the allowed list.
     sql = None
     raw_results = None
-    max_retries = get_settings().llm.max_retries
+    max_retries = settings.llm.max_retries
     error_context = ""
 
     for attempt in range(max_retries):
+        audit.validation_attempts = attempt + 1
         yield {"data": json.dumps({
             "status": f"Generating SQL (Attempt {attempt + 1})...",
             "error_context": error_context,
@@ -93,6 +133,7 @@ async def execute_nlq_stream(
             logger.info("Generated SQL (attempt %d):\n%s", attempt + 1, generated_sql)
         except Exception as e:
             logger.exception("LLM generation failed")
+            _emit_audit("error", error=f"LLM Generation failed: {e}")
             yield {"data": json.dumps({
                 "status": "error",
                 "message": f"LLM Generation failed: {e}",
@@ -105,8 +146,10 @@ async def execute_nlq_stream(
             sql = generated_sql
         except SQLValidationError as e:
             error_context = f"Validation Error: {e}"
+            audit.validation_errors.append(str(e))
             logger.warning("SQL validation rejected attempt %d: %s", attempt + 1, e)
             if attempt == max_retries - 1:
+                _emit_audit("error", error=f"Failed to generate valid SQL: {error_context}")
                 yield {"data": json.dumps({
                     "status": "error",
                     "message": f"Failed to generate valid SQL: {error_context}",
@@ -123,6 +166,7 @@ async def execute_nlq_stream(
             error_context = f"MySQL Database Error: {e}"
             logger.warning("MySQL execution rejected attempt %d: %s", attempt + 1, e)
             if attempt == max_retries - 1:
+                _emit_audit("error", error=f"Database Execution Failed: {error_context}")
                 yield {"data": json.dumps({
                     "status": "error",
                     "message": f"Database Execution Failed: {error_context}",
@@ -130,16 +174,25 @@ async def execute_nlq_stream(
                 return
             continue
 
+    audit.executed_sql = sql
+    audit.rows_returned = len(raw_results) if raw_results else 0
+
     # 4. PII masking
     yield {"data": json.dumps({"status": "Applying PII masking..."})}
-    safe_results = mask_pii(raw_results, pii_tags, user_identity)
+    safe_results = mask_pii(raw_results, pii_tags, user_identity, settings)
+    if not audit.unmask_pii:
+        # The columns the masker actually redacted.
+        all_pii_cols = sorted({c for cols in (pii_tags or {}).values() for c in cols})
+        audit.pii_columns_masked = all_pii_cols
 
     # 5. Done
-    logger.info("NLQ complete | role=%s | rows=%d",
-                user_identity.get("role"), len(safe_results))
+    logger.info("NLQ complete | id=%s user=%s rows=%d",
+                audit.request_id[:8], who, len(safe_results))
+    _emit_audit("ok")
     yield {"event": "complete", "data": json.dumps({
         "results": safe_results,
         "executed_sql": sql,
+        "request_id": audit.request_id,
     })}
 
 

@@ -102,6 +102,13 @@ class OpenMetadataClient(CatalogClient):
     async def get_allowed_views_and_pii(
         self, user_identity: dict
     ) -> Tuple[List[ViewInfo], PiiTagMap]:
+        """Phase A-C: returns views using the hardcoded `_ROLE_VIEW_MAP`.
+
+        Phase D NOTE: this method is preserved for offline / mock paths but
+        the real-Keycloak request flow uses ``om_access.resolve_allowed_views``
+        + ``fetch_views_with_pii`` instead — the role→view decision happens
+        in OM (via tag policies), not in this Python dict.
+        """
         role = user_identity.get("role")
         allowed_names = _ROLE_VIEW_MAP.get(role or "", [])
         if not allowed_names:
@@ -114,6 +121,66 @@ class OpenMetadataClient(CatalogClient):
             "OM returned %d views for role=%r, pii_tagged_views=%d",
             len(views), role, len(pii_tags),
         )
+        return views, pii_tags
+
+    async def fetch_views_with_pii(
+        self,
+        view_names: List[str],
+        bearer_token: Optional[str] = None,
+    ) -> Tuple[List[ViewInfo], PiiTagMap]:
+        """Phase D: hydrate ViewInfo + PII tags for a pre-authorized name list.
+
+        Uses the user's JWT (``bearer_token``) when provided — required when
+        OM is in OIDC-only mode (no admin login). Falls back to the
+        admin login flow only when ``bearer_token`` is None (legacy / dev).
+        """
+        if not view_names:
+            return [], {}
+
+        # Decide which auth header to send.
+        if bearer_token:
+            req_headers = {
+                "Authorization": f"Bearer {bearer_token}",
+                "Content-Type": "application/json",
+            }
+        else:
+            req_headers = self._headers()
+
+        def _fetch_one(name: str):
+            fqn = f"{self._TABLES_DATABASE_FQN}.{name}"
+            try:
+                resp = requests.get(
+                    f"{self._url}/tables/name/{fqn}",
+                    params={"fields": "columns,tags"},
+                    headers=req_headers,
+                    timeout=10,
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "OM fetch_views_with_pii: %s → HTTP %s", name, resp.status_code,
+                    )
+                    return None
+                return resp.json()
+            except Exception:
+                logger.exception("OM fetch_views_with_pii failed for %s", name)
+                return None
+
+        # Sequential is fine for our scale; asyncio.to_thread keeps the loop free.
+        raw_tables: List[Optional[dict]] = []
+        for n in view_names:
+            raw_tables.append(await asyncio.to_thread(_fetch_one, n))
+
+        views: List[ViewInfo] = []
+        pii_tags: PiiTagMap = {}
+        for raw in raw_tables:
+            if not raw:
+                continue
+            v, p = _extract_view_and_pii(raw)
+            if v is None:
+                continue
+            views.append(v)
+            if p:
+                pii_tags[v.name] = p
         return views, pii_tags
 
     # ------------------------------------------------------------- internal #
@@ -142,39 +209,44 @@ class OpenMetadataClient(CatalogClient):
 # --------------------------------------------------------------------------- #
 
 
+def _extract_view_and_pii(raw: dict) -> Tuple[Optional[ViewInfo], List[str]]:
+    """Convert one OM /tables payload into (ViewInfo, [pii_column_names])."""
+    name = raw.get("name")
+    if not name:
+        return None, []
+    columns: List[ColumnInfo] = []
+    pii_cols: List[str] = []
+    for c in raw.get("columns") or []:
+        col_name = c.get("name")
+        if not col_name:
+            continue
+        columns.append(
+            ColumnInfo(name=col_name, description=c.get("description") or "")
+        )
+        for tag in c.get("tags") or []:
+            if tag.get("tagFQN") == "PII.Sensitive":
+                pii_cols.append(col_name)
+    view = ViewInfo(
+        name=name,
+        description=raw.get("description") or "",
+        columns=columns,
+    )
+    return view, pii_cols
+
+
 def _filter_views(
     om_tables: List[dict], allowed_names: List[str]
 ) -> Tuple[List[ViewInfo], PiiTagMap]:
     allowed_set = set(allowed_names)
     views: List[ViewInfo] = []
     pii_tags: PiiTagMap = {}
-
     for t in om_tables:
-        name = t.get("name")
-        if name not in allowed_set:
+        if t.get("name") not in allowed_set:
             continue
-
-        columns: List[ColumnInfo] = []
-        table_pii: List[str] = []
-        for c in t.get("columns") or []:
-            col_name = c.get("name")
-            if not col_name:
-                continue
-            columns.append(
-                ColumnInfo(name=col_name, description=c.get("description") or "")
-            )
-            for tag in c.get("tags") or []:
-                if tag.get("tagFQN") == "PII.Sensitive":
-                    table_pii.append(col_name)
-
-        views.append(
-            ViewInfo(
-                name=name,
-                description=t.get("description") or "",
-                columns=columns,
-            )
-        )
-        if table_pii:
-            pii_tags[name] = table_pii
-
+        view, pii_cols = _extract_view_and_pii(t)
+        if view is None:
+            continue
+        views.append(view)
+        if pii_cols:
+            pii_tags[view.name] = pii_cols
     return views, pii_tags

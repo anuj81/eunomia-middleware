@@ -89,6 +89,77 @@ class RagConfig(BaseModel):
     api_key: Optional[str] = None  # env-only
 
 
+class KeycloakConfig(BaseModel):
+    """Used when auth.provider == 'keycloak'."""
+
+    issuer: str = "http://localhost:8080/realms/eunomia"
+    # OPTIONAL — if set, JWT 'aud' claim must contain this value. Leave empty
+    # to skip aud validation (Keycloak's default tokens have empty 'aud').
+    audience: Optional[str] = None
+    # How long to cache the JWKS document before re-fetching.
+    jwks_cache_seconds: int = 300
+    # Required signing algorithm. Keycloak default is RS256.
+    algorithm: Literal["RS256", "RS384", "RS512"] = "RS256"
+
+
+class AuthConfig(BaseModel):
+    """How does the middleware authenticate inbound requests?
+
+    'mock'      — preserve pre-Phase-D string-match behavior for offline tests.
+    'keycloak'  — validate Keycloak-issued JWTs against the configured JWKS.
+    """
+
+    provider: Literal["mock", "keycloak"] = "mock"
+    keycloak: KeycloakConfig = Field(default_factory=KeycloakConfig)
+
+    # Roles that have special meaning ABOVE the view-access matrix.
+    # `unmask_pii_role`   — holder sees PII columns unmasked (D.4 consumes this).
+    # `admin_bypass_role` — holder skips tag filtering, sees the full catalog.
+    unmask_pii_role: str = "eunomia-pii-unmask"
+    admin_bypass_role: str = "eunomia-om-admin"
+
+
+class AuditConfig(BaseModel):
+    """Per-request audit logging — dual sink, independent of the main logger.
+
+    Two files written per request, side by side under ``log_dir``:
+        • <human_file>  — one line of human-readable text per NLQ
+        • <jsonl_file>  — one newline-delimited JSON record per NLQ (for SIEM)
+
+    Audit is always-on at INFO equivalent regardless of logging.level so that
+    operators can never accidentally silence the trust record.
+    """
+
+    enabled: bool = True
+    # Defaults to the same directory the main logger writes to; override if
+    # you want audit on a separate volume or with different retention.
+    log_dir: Optional[Path] = None      # None → use settings.logging.log_dir
+    human_file: str = "audit.log"
+    jsonl_file: str = "audit.jsonl"
+    max_bytes: int = 10_485_760
+    backup_count: int = 5
+
+
+class AuthzConfig(BaseModel):
+    """Authorization mapping: which Keycloak realm role → which OM tag FQN.
+
+    The Keycloak-role → OM-tag relationship is a NAMING CONVENTION, not a
+    policy decision. The actual decision (which views does the tag grant?)
+    lives in OpenMetadata's tag/policy seeding (see seed_om_policies.py).
+    """
+
+    # Use '*' as a wildcard meaning 'skip tag filtering, return all views'.
+    role_to_access_tag: Dict[str, str] = Field(
+        default_factory=lambda: {
+            "eunomia-finance-user":     "eunomia-access.finance-user",
+            "eunomia-external-auditor": "eunomia-access.external-auditor",
+            "eunomia-marketing-lead":   "eunomia-access.marketing-lead",
+            "eunomia-agency-partner":   "eunomia-access.agency-partner",
+            "eunomia-om-admin":         "*",
+        }
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Top-level Settings                                                          #
 # --------------------------------------------------------------------------- #
@@ -112,6 +183,9 @@ class Settings(BaseSettings):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
+    authz: AuthzConfig = Field(default_factory=AuthzConfig)
+    audit: AuditConfig = Field(default_factory=AuditConfig)
 
 
 # --------------------------------------------------------------------------- #
