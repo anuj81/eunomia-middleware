@@ -2,9 +2,15 @@ fastapi
 uvicorn
 pydantic
 pydantic-settings
+pyyaml
 sqlglot
-openai
+google-genai
 sse-starlette
-psycopg2-binary
-openmetadata-api
+mysql-connector-python
 python-dotenv
+requests
+httpx
+
+# test
+pytest
+pytest-asyncio

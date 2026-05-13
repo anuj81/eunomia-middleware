@@ -15,5 +15,7 @@ def verify_token(request: Request) -> dict:
         return {"role": "Marketing Lead", "domain": "Marketing"}
     elif token == "agency-token":
         return {"role": "Agency Partner", "domain": "Marketing"}
+    elif token == "external-auditor-token":
+        return {"role": "External Auditor", "domain": "Finance"}
     
     return {"role": "Unknown"}

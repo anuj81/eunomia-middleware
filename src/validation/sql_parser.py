@@ -9,9 +9,9 @@ def validate_sql(query: str, allowed_views: list[str]) -> bool:
     Validates that the SQL query is a SELECT statement and only references allowed views.
     """
     try:
-        # Parse the query using the Postgres dialect
+        # Parse the query using the MySQL dialect
         # sqlglot.parse returns a list of expressions. For single statements, len should be 1.
-        parsed_statements = sqlglot.parse(query, read="postgres")
+        parsed_statements = sqlglot.parse(query, read="mysql")
     except sqlglot.errors.ParseError as e:
         raise SQLValidationError(f"SQL Syntax Error: {str(e)}")
 
