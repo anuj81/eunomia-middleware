@@ -1,0 +1,87 @@
+# Eunomia Middleware — default configuration.
+#
+# Precedence (highest wins):
+#   1. CLI flags          (e.g. --verbose DEBUG, --openmetadata-mock, --config path)
+#   2. Environment vars   (EUNOMIA_<SECTION>__<FIELD>, or well-known names below)
+#   3. This YAML file
+#   4. Built-in defaults
+#
+# Secrets MUST NOT be set here. They must come from environment variables
+# (see .env.example). The loader will raise a startup error if it finds any of:
+#   openmetadata.password, database.password, llm.api_key, rag.api_key.
+#
+# Well-known secret env vars (no EUNOMIA_ prefix needed):
+#   OPENMETADATA_PASSWORD, DB_PASSWORD, GEMINI_API_KEY, RAG_API_KEY
+
+logging:
+  level: INFO                   # DEBUG | INFO | WARN | ERROR
+  log_dir: ./logs               # relative to eunomia-middleware/, or absolute
+  console: true                 # write logs to stdout
+  file: true                    # write logs to <log_dir>/eunomia.log
+  rotation:
+    max_bytes: 10485760         # 10 MiB per file before rotation
+    backup_count: 5             # keep up to 5 rotated files
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  reload: true                  # uvicorn auto-reload (dev only)
+
+openmetadata:
+  mock: true                    # true → MockOpenMetadataClient (fixture); false → real OM REST
+  url: http://localhost:8585/api/v1
+  username: admin@open-metadata.org
+  # password: <env-only — see OPENMETADATA_PASSWORD>
+
+database:
+  driver: mysql                 # Phase 1 primary DB
+  host: localhost
+  port: 3306
+  user: api_user
+  name: zenith_corp_eunomia
+  # password: <env-only — see DB_PASSWORD>
+
+llm:
+  provider: gemini
+  model: gemini-2.5-flash
+  max_retries: 3
+  # api_key: <env-only — see GEMINI_API_KEY>
+
+rag:
+  enabled: true                 # Phase C: on. Set false to skip relevance narrowing entirely.
+  mock: true                    # true → MockRagClient (keyword overlap, no network);
+                                # false → HttpRagClient → eunomia-rag service
+  url: http://localhost:9000
+  top_k: 8
+  timeout_seconds: 5
+  # api_key: <env-only — see RAG_API_KEY>
+
+# Authentication (Phase D)
+auth:
+  provider: mock                # 'mock' → string-match tokens (offline / CI)
+                                # 'keycloak' → validate Keycloak JWTs against JWKS
+  keycloak:
+    issuer: http://localhost:8080/realms/eunomia
+    audience: null              # null → skip aud check (Keycloak default tokens have empty 'aud')
+    jwks_cache_seconds: 300
+    algorithm: RS256
+  unmask_pii_role: eunomia-pii-unmask
+  admin_bypass_role: eunomia-om-admin
+
+# Authorization map — Keycloak realm role → OM tag FQN. Decision lives in OM.
+authz:
+  role_to_access_tag:
+    eunomia-finance-user:     eunomia-access.finance-user
+    eunomia-external-auditor: eunomia-access.external-auditor
+    eunomia-marketing-lead:   eunomia-access.marketing-lead
+    eunomia-agency-partner:   eunomia-access.agency-partner
+    eunomia-om-admin:         "*"   # wildcard — admin sees the full catalog
+
+# Per-request audit trail (Phase D)
+audit:
+  enabled: true
+  # log_dir: ./logs           # leave null/unset to use logging.log_dir
+  human_file: audit.log       # one human-readable line per request
+  jsonl_file: audit.jsonl     # one JSON object per request (SIEM-friendly)
+  max_bytes: 10485760         # 10 MiB rotation threshold
+  backup_count: 5

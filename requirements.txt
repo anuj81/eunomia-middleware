@@ -2,9 +2,18 @@ fastapi
 uvicorn
 pydantic
 pydantic-settings
+pyyaml
 sqlglot
-openai
+google-genai
 sse-starlette
-psycopg2-binary
-openmetadata-api
+mysql-connector-python
 python-dotenv
+requests
+httpx
+
+# JWT validation (Phase D — Keycloak OIDC)
+python-jose[cryptography]
+
+# test
+pytest
+pytest-asyncio
